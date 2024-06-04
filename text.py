@@ -5,6 +5,11 @@ import torchvision.transforms.v2 as T
 import folder_paths
 
 FONTS_DIR = os.path.join(folder_paths.models_dir, "fonts")
+if not os.path.exists(FONTS_DIR):
+    try:
+        os.makedirs(FONTS_DIR, exist_ok=True)
+    except:
+        print(f'create FONTS_DIR {FONTS_DIR} failed')
 class DrawText:
     @classmethod
     def INPUT_TYPES(s):
