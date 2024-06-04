@@ -2,6 +2,7 @@ import torch
 import torchvision.transforms.v2 as T
 import torch.nn.functional as F
 from .utils import expand_mask
+import os
 
 class LoadCLIPSegModels:
     @classmethod
@@ -16,8 +17,12 @@ class LoadCLIPSegModels:
 
     def execute(self):
         from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
-        processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
-        model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
+        if os.path.exists('/stable-diffusion-cache/models/transformers/models--CIDAS--clipseg-rd64-refined'):
+            processor = CLIPSegProcessor.from_pretrained("/stable-diffusion-cache/models/transformers/models--CIDAS--clipseg-rd64-refined")
+            model = CLIPSegForImageSegmentation.from_pretrained("/stable-diffusion-cache/models/transformers/models--CIDAS--clipseg-rd64-refined")
+        else:
+            processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
+            model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
 
         return ((processor, model),)
 
