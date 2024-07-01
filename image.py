@@ -55,9 +55,9 @@ class ImageBatchMultiple:
         return {
             "required": {
                 "image_1": ("IMAGE",),
-                "image_2": ("IMAGE",),
                 "method": (["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], { "default": "lanczos" }),
             }, "optional": {
+                "image_2": ("IMAGE",),
                 "image_3": ("IMAGE",),
                 "image_4": ("IMAGE",),
                 "image_5": ("IMAGE",),
@@ -67,11 +67,13 @@ class ImageBatchMultiple:
     FUNCTION = "execute"
     CATEGORY = "essentials/image batch"
 
-    def execute(self, image_1, image_2, method, image_3=None, image_4=None, image_5=None):
-        if image_1.shape[1:] != image_2.shape[1:]:
-            image_2 = comfy.utils.common_upscale(image_2.movedim(-1,1), image_1.shape[2], image_1.shape[1], method, "center").movedim(1,-1)
-        out = torch.cat((image_1, image_2), dim=0)
+    def execute(self, image_1, method, image_2=None, image_3=None, image_4=None, image_5=None):
+        out = image_1
 
+        if image_2 is not None:
+            if image_1.shape[1:] != image_2.shape[1:]:
+                image_2 = comfy.utils.common_upscale(image_2.movedim(-1,1), image_1.shape[2], image_1.shape[1], method, "center").movedim(1,-1)
+            out = torch.cat((image_1, image_2), dim=0)
         if image_3 is not None:
             if image_1.shape[1:] != image_3.shape[1:]:
                 image_3 = comfy.utils.common_upscale(image_3.movedim(-1,1), image_1.shape[2], image_1.shape[1], method, "center").movedim(1,-1)
@@ -734,8 +736,8 @@ class ImageApplyLUT:
             "required": {
                 "image": ("IMAGE",),
                 "lut_file": ([f for f in os.listdir(LUTS_DIR) if f.lower().endswith('.cube')], ),
-                "log_colorspace": ("BOOLEAN", { "default": False }),
-                "clip_values": ("BOOLEAN", { "default": False }),
+                "gamma_correction": ("BOOLEAN", { "default": True }),
+                "clip_values": ("BOOLEAN", { "default": True }),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1 }),
             }}
 
@@ -744,7 +746,7 @@ class ImageApplyLUT:
     CATEGORY = "essentials/image processing"
 
     # TODO: check if we can do without numpy
-    def execute(self, image, lut_file, log_colorspace, clip_values, strength):
+    def execute(self, image, lut_file, gamma_correction, clip_values, strength):
         from colour.io.luts.iridas_cube import read_LUT_IridasCube
 
         device = image.device
@@ -771,10 +773,10 @@ class ImageApplyLUT:
             if is_non_default_domain:
                 dom_scale = lut.domain[1] - lut.domain[0]
                 lut_img = lut_img * dom_scale + lut.domain[0]
-            if log_colorspace:
+            if gamma_correction:
                 lut_img = lut_img ** (1/2.2)
             lut_img = lut.apply(lut_img)
-            if log_colorspace:
+            if gamma_correction:
                 lut_img = lut_img ** (2.2)
             if is_non_default_domain:
                 lut_img = (lut_img - lut.domain[0]) / dom_scale
@@ -878,6 +880,126 @@ class ExtractKeyframes:
 
         return (image[keyframes], ','.join(map(str, keyframes)),)
 
+class ImageColorMatch:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "color_space": (["LAB", "YCbCr", "RGB", "LUV", "YUV", "XYZ"],),
+                "factor": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, }),
+                "device": (["auto", "cpu", "gpu"],),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "essentials/image processing"
+
+    def execute(self, image, reference, color_space, factor, device):
+        import kornia
+
+        if "gpu" == device:
+            device = comfy.model_management.get_torch_device()
+        elif "auto" == device:
+            device = comfy.model_management.intermediate_device()
+        else:
+            device = 'cpu'
+
+        image = image.permute([0, 3, 1, 2]).to(device)
+        reference = reference.permute([0, 3, 1, 2]).to(device)
+
+        if "LAB" == color_space:
+            image = kornia.color.rgb_to_lab(image)
+            reference = kornia.color.rgb_to_lab(reference)
+        elif "YCbCr" == color_space:
+            image = kornia.color.rgb_to_ycbcr(image)
+            reference = kornia.color.rgb_to_ycbcr(reference)
+        elif "LUV" == color_space:
+            image = kornia.color.rgb_to_luv(image)
+            reference = kornia.color.rgb_to_luv(reference)
+        elif "YUV" == color_space:
+            image = kornia.color.rgb_to_yuv(image)
+            reference = kornia.color.rgb_to_yuv(reference)
+        elif "XYZ" == color_space:
+            image = kornia.color.rgb_to_xyz(image)
+            reference = kornia.color.rgb_to_xyz(reference)
+
+        image_mean, image_std = self.compute_mean_std(image)
+        reference_mean, reference_std = self.compute_mean_std(reference)
+        out = ((image - image_mean) / (image_std + 1e-6)) * (reference_std + 1e-6) + reference_mean
+        out = factor * out + (1 - factor) * image
+
+        if "LAB" == color_space:
+            out = kornia.color.lab_to_rgb(out)
+        elif "YCbCr" == color_space:
+            out = kornia.color.ycbcr_to_rgb(out)
+        elif "LUV" == color_space:
+            out = kornia.color.luv_to_rgb(out)
+        elif "YUV" == color_space:
+            out = kornia.color.yuv_to_rgb(out)
+        elif "XYZ" == color_space:
+            out = kornia.color.xyz_to_rgb(out)
+
+        out = out.permute([0, 2, 3, 1]).clamp(0, 1).to(comfy.model_management.intermediate_device())
+
+        return (out,)
+
+    def compute_mean_std(self, image):
+        mean = torch.mean(image, dim=(2, 3), keepdim=True)
+        std = torch.std(image, dim=(2, 3), keepdim=True)
+        return mean, std
+
+class ImageHistogramMatch:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "reference": ("IMAGE",),
+                "method": (["pytorch", "skimage"],),
+                "factor": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, }),
+                "device": (["auto", "cpu", "gpu"],),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "essentials/image processing"
+
+    def execute(self, image, reference, method, factor, device):
+        if "gpu" == device:
+            device = comfy.model_management.get_torch_device()
+        elif "auto" == device:
+            device = comfy.model_management.intermediate_device()
+        else:
+            device = 'cpu'
+
+        if "pytorch" in method:
+            from .histogram_matching import Histogram_Matching
+
+            image = image.permute([0, 3, 1, 2]).to(device)
+            reference = reference.permute([0, 3, 1, 2]).to(device)[0].unsqueeze(0)
+            image.requires_grad = True
+            reference.requires_grad = True
+
+            out = []
+
+            for i in image:
+                i = i.unsqueeze(0)
+                hm = Histogram_Matching(differentiable=True)
+                out.append(hm(i, reference))
+            out = torch.cat(out, dim=0)
+            out = factor * out + (1 - factor) * image
+            out = out.permute([0, 2, 3, 1]).clamp(0, 1)
+        else:
+            from skimage.exposure import match_histograms
+
+            out = torch.from_numpy(match_histograms(image.cpu().numpy(), reference.cpu().numpy(), channel_axis=3)).to(device)
+            out = factor * out + (1 - factor) * image.to(device)
+
+        return (out.to(comfy.model_management.intermediate_device()),)
 
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -907,7 +1029,7 @@ class ImageToDevice:
         else:
             device = 'cpu'
 
-        image = image.to(device)
+        image = image.clone().to(device)
         torch.cuda.empty_cache()
 
         return (image,)
@@ -954,7 +1076,7 @@ IMAGE_CLASS_MAPPINGS = {
     # Image batch
     "ImageBatchMultiple+": ImageBatchMultiple,
     "ImageExpandBatch+": ImageExpandBatch,
-    #"ImageFromBatch+": ImageFromBatch,
+    "ImageFromBatch+": ImageFromBatch,
     "ImageListToBatch+": ImageListToBatch,
 
     # Image manipulation
@@ -975,6 +1097,8 @@ IMAGE_CLASS_MAPPINGS = {
     "ImageDesaturate+": ImageDesaturate,
     "PixelOEPixelize+": PixelOEPixelize,
     "ImagePosterize+": ImagePosterize,
+    "ImageColorMatch+": ImageColorMatch,
+    "ImageHistogramMatch+": ImageHistogramMatch,
 
     # Utilities
     "GetImageSize+": GetImageSize,
@@ -990,7 +1114,7 @@ IMAGE_NAME_MAPPINGS = {
     # Image batch
     "ImageBatchMultiple+": "🔧 Images Batch Multiple",
     "ImageExpandBatch+": "🔧 Image Expand Batch",
-    #"ImageFromBatch+": "🔧 Image From Batch",
+    "ImageFromBatch+": "🔧 Image From Batch",
     "ImageListToBatch+": "🔧 Image List To Batch",
 
     # Image manipulation
@@ -1011,6 +1135,8 @@ IMAGE_NAME_MAPPINGS = {
     "ImageDesaturate+": "🔧 Image Desaturate",
     "PixelOEPixelize+": "🔧 Pixelize",
     "ImagePosterize+": "🔧 Image Posterize",
+    "ImageColorMatch+": "🔧 Image Color Match",
+    "ImageHistogramMatch+": "🔧 Image Histogram Match",
 
     # Utilities
     "GetImageSize+": "🔧 Get Image Size",
