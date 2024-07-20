@@ -237,6 +237,91 @@ class ImageCompositeFromMaskBatch:
 
         return (out, )
 
+class ImageComposite:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination": ("IMAGE",),
+                "source": ("IMAGE",),
+                "x": ("INT", { "default": 0, "min": -MAX_RESOLUTION, "max": MAX_RESOLUTION, "step": 1 }),
+                "y": ("INT", { "default": 0, "min": -MAX_RESOLUTION, "max": MAX_RESOLUTION, "step": 1 }),
+                "offset_x": ("INT", { "default": 0, "min": -MAX_RESOLUTION, "max": MAX_RESOLUTION, "step": 1 }),
+                "offset_y": ("INT", { "default": 0, "min": -MAX_RESOLUTION, "max": MAX_RESOLUTION, "step": 1 }),
+            },
+            "optional": {
+                "mask": ("MASK",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "execute"
+    CATEGORY = "essentials/image manipulation"
+
+    def execute(self, destination, source, x, y, offset_x, offset_y, mask=None):
+        if mask is None:
+            mask = torch.ones_like(source)[:,:,:,0]
+        
+        mask = mask.unsqueeze(-1).repeat(1, 1, 1, 3)
+
+        if mask.shape[1:3] != source.shape[1:3]:
+            mask = F.interpolate(mask.permute([0, 3, 1, 2]), size=(source.shape[1], source.shape[2]), mode='bicubic')
+            mask = mask.permute([0, 2, 3, 1])
+        
+        if mask.shape[0] > source.shape[0]:
+            mask = mask[:source.shape[0]]
+        elif mask.shape[0] < source.shape[0]:
+            mask = torch.cat((mask, mask[-1:].repeat((source.shape[0]-mask.shape[0], 1, 1, 1))), dim=0)
+        
+        if destination.shape[0] > source.shape[0]:
+            destination = destination[:source.shape[0]]
+        elif destination.shape[0] < source.shape[0]:
+            destination = torch.cat((destination, destination[-1:].repeat((source.shape[0]-destination.shape[0], 1, 1, 1))), dim=0)
+        
+        if not isinstance(x, list):
+            x = [x]
+        if not isinstance(y, list):
+            y = [y]
+        
+        if len(x) < destination.shape[0]:
+            x = x + [x[-1]] * (destination.shape[0] - len(x))
+        if len(y) < destination.shape[0]:
+            y = y + [y[-1]] * (destination.shape[0] - len(y))
+        
+        x = [i + offset_x for i in x]
+        y = [i + offset_y for i in y]
+
+        output = []
+        for i in range(destination.shape[0]):
+            d = destination[i].clone()
+            s = source[i]
+            m = mask[i]
+
+            if x[i]+source.shape[2] > destination.shape[2]:
+                s = s[:, :, :destination.shape[2]-x[i], :]
+                m = m[:, :, :destination.shape[2]-x[i], :]
+            if y[i]+source.shape[1] > destination.shape[1]:
+                s = s[:, :destination.shape[1]-y[i], :, :]
+                m = m[:destination.shape[1]-y[i], :, :]
+            
+            #output.append(s * m + d[y[i]:y[i]+s.shape[0], x[i]:x[i]+s.shape[1], :] * (1 - m))
+            d[y[i]:y[i]+s.shape[0], x[i]:x[i]+s.shape[1], :] = s * m + d[y[i]:y[i]+s.shape[0], x[i]:x[i]+s.shape[1], :] * (1 - m)
+            output.append(d)
+        
+        output = torch.stack(output)
+
+        # apply the source to the destination at XY position using the mask
+        #for i in range(destination.shape[0]):
+        #    output[i, y[i]:y[i]+source.shape[1], x[i]:x[i]+source.shape[2], :] = source * mask + destination[i, y[i]:y[i]+source.shape[1], x[i]:x[i]+source.shape[2], :] * (1 - mask)
+
+        #for x_, y_ in zip(x, y):
+        #    output[:, y_:y_+source.shape[1], x_:x_+source.shape[2], :] = source * mask + destination[:, y_:y_+source.shape[1], x_:x_+source.shape[2], :] * (1 - mask)
+
+        #output[:, y:y+source.shape[1], x:x+source.shape[2], :] = source * mask + destination[:, y:y+source.shape[1], x:x+source.shape[2], :] * (1 - mask)
+        #output = destination * (1 - mask) + source * mask
+
+        return (output,)
+
 class ImageResize:
     @classmethod
     def INPUT_TYPES(s):
@@ -676,10 +761,42 @@ class RemBGSession:
     CATEGORY = "essentials/image manipulation"
 
     def execute(self, model, providers):
-        from rembg import new_session
+        from rembg import new_session, remove
 
         model = model.split(":")[0]
-        return (new_session(model, providers=[providers+"ExecutionProvider"]),)
+
+        class Session:
+            def __init__(self, model, providers):
+                self.session = new_session(model, providers=[providers+"ExecutionProvider"])
+            def process(self, image):
+                return remove(image, session=self.session)
+            
+        return (Session(model, providers),)
+
+class TransparentBGSession:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "mode": (["base", "fast", "base-nightly"],),
+                "use_jit": ("BOOLEAN", { "default": True }),
+            },
+        }
+
+    RETURN_TYPES = ("REMBG_SESSION",)
+    FUNCTION = "execute"
+    CATEGORY = "essentials/image manipulation"
+
+    def execute(self, mode, use_jit):
+        from transparent_background import Remover
+
+        class Session:
+            def __init__(self, mode, use_jit):
+                self.session = Remover(mode=mode, jit=use_jit)
+            def process(self, image):
+                return self.session.process(image)
+
+        return (Session(mode, use_jit),)
 
 class ImageRemoveBackground:
     @classmethod
@@ -696,13 +813,11 @@ class ImageRemoveBackground:
     CATEGORY = "essentials/image manipulation"
 
     def execute(self, rembg_session, image):
-        from rembg import remove as rembg
-
         image = image.permute([0, 3, 1, 2])
         output = []
         for img in image:
             img = T.ToPILImage()(img)
-            img = rembg(img, session=rembg_session)
+            img = rembg_session.process(img)
             output.append(T.ToTensor()(img))
 
         output = torch.stack(output, dim=0)
@@ -974,6 +1089,7 @@ class ImageColorMatch:
                 "color_space": (["LAB", "YCbCr", "RGB", "LUV", "YUV", "XYZ"],),
                 "factor": ("FLOAT", { "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, }),
                 "device": (["auto", "cpu", "gpu"],),
+                "batch_size": ("INT", { "default": 0, "min": 0, "max": 1024, "step": 1, }),
             }
         }
 
@@ -981,7 +1097,7 @@ class ImageColorMatch:
     FUNCTION = "execute"
     CATEGORY = "essentials/image processing"
 
-    def execute(self, image, reference, color_space, factor, device):
+    def execute(self, image, reference, color_space, factor, device, batch_size):
         import kornia
 
         if "gpu" == device:
@@ -991,44 +1107,64 @@ class ImageColorMatch:
         else:
             device = 'cpu'
 
-        image = image.permute([0, 3, 1, 2]).to(device)
+        image = image.permute([0, 3, 1, 2])
         reference = reference.permute([0, 3, 1, 2]).to(device)
 
+        if batch_size == 0 or batch_size > image.shape[0]:
+            batch_size = image.shape[0]
+
         if "LAB" == color_space:
-            image = kornia.color.rgb_to_lab(image)
             reference = kornia.color.rgb_to_lab(reference)
         elif "YCbCr" == color_space:
-            image = kornia.color.rgb_to_ycbcr(image)
             reference = kornia.color.rgb_to_ycbcr(reference)
         elif "LUV" == color_space:
-            image = kornia.color.rgb_to_luv(image)
             reference = kornia.color.rgb_to_luv(reference)
         elif "YUV" == color_space:
-            image = kornia.color.rgb_to_yuv(image)
             reference = kornia.color.rgb_to_yuv(reference)
         elif "XYZ" == color_space:
-            image = kornia.color.rgb_to_xyz(image)
             reference = kornia.color.rgb_to_xyz(reference)
 
-        image_mean, image_std = self.compute_mean_std(image)
         reference_mean, reference_std = self.compute_mean_std(reference)
-        out = ((image - image_mean) / (image_std + 1e-6)) * (reference_std + 1e-6) + reference_mean
-        out = factor * out + (1 - factor) * image
 
-        if "LAB" == color_space:
-            out = kornia.color.lab_to_rgb(out)
-        elif "YCbCr" == color_space:
-            out = kornia.color.ycbcr_to_rgb(out)
-        elif "LUV" == color_space:
-            out = kornia.color.luv_to_rgb(out)
-        elif "YUV" == color_space:
-            out = kornia.color.yuv_to_rgb(out)
-        elif "XYZ" == color_space:
-            out = kornia.color.xyz_to_rgb(out)
+        image_batch = torch.split(image, batch_size, dim=0)
+        output = []
 
-        out = out.permute([0, 2, 3, 1]).clamp(0, 1).to(comfy.model_management.intermediate_device())
+        for image in image_batch:
+            image = image.to(device)
 
-        return (out,)
+            if "LAB" == color_space:
+                image = kornia.color.rgb_to_lab(image)
+            elif "YCbCr" == color_space:
+                image = kornia.color.rgb_to_ycbcr(image)
+            elif "LUV" == color_space:
+                image = kornia.color.rgb_to_luv(image)
+            elif "YUV" == color_space:
+                image = kornia.color.rgb_to_yuv(image)
+            elif "XYZ" == color_space:
+                image = kornia.color.rgb_to_xyz(image)
+
+            image_mean, image_std = self.compute_mean_std(image)
+            out = ((image - image_mean) / (image_std + 1e-6)) * (reference_std + 1e-6) + reference_mean
+            out = factor * out + (1 - factor) * image
+
+            if "LAB" == color_space:
+                out = kornia.color.lab_to_rgb(out)
+            elif "YCbCr" == color_space:
+                out = kornia.color.ycbcr_to_rgb(out)
+            elif "LUV" == color_space:
+                out = kornia.color.luv_to_rgb(out)
+            elif "YUV" == color_space:
+                out = kornia.color.yuv_to_rgb(out)
+            elif "XYZ" == color_space:
+                out = kornia.color.xyz_to_rgb(out)
+
+            out = out.permute([0, 2, 3, 1]).clamp(0, 1).to(comfy.model_management.intermediate_device())
+            output.append(out)
+        
+        out = None
+        output = torch.cat(output, dim=0)
+
+        return (output,)
 
     def compute_mean_std(self, image):
         mean = torch.mean(image, dim=(2, 3), keepdim=True)
@@ -1238,7 +1374,7 @@ class NoiseFromImage:
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "execute"
-    CATEGORY = "essentials"
+    CATEGORY = "essentials/image utils"
 
     def execute(self, image, noise_size, color_noise, mask_strength, mask_scale_diff, mask_contrast, noise_strenght, saturation, contrast, blur, noise_mask=None):
         torch.manual_seed(0)
@@ -1330,6 +1466,7 @@ IMAGE_CLASS_MAPPINGS = {
 
     # Image manipulation
     "ImageCompositeFromMaskBatch+": ImageCompositeFromMaskBatch,
+    "ImageComposite+": ImageComposite,
     "ImageCrop+": ImageCrop,
     "ImageFlip+": ImageFlip,
     "ImageRandomTransform+": ImageRandomTransform,
@@ -1340,6 +1477,7 @@ IMAGE_CLASS_MAPPINGS = {
     "ImageTile+": ImageTile,
     "ImageUntile+": ImageUntile,
     "RemBGSession+": RemBGSession,
+    "TransparentBGSession+": TransparentBGSession,
 
     # Image processing
     "ImageApplyLUT+": ImageApplyLUT,
@@ -1371,6 +1509,7 @@ IMAGE_NAME_MAPPINGS = {
 
     # Image manipulation
     "ImageCompositeFromMaskBatch+": "🔧 Image Composite From Mask Batch",
+    "ImageComposite+": "🔧 Image Composite",
     "ImageCrop+": "🔧 Image Crop",
     "ImageFlip+": "🔧 Image Flip",
     "ImageRandomTransform+": "🔧 Image Random Transform",
@@ -1381,6 +1520,7 @@ IMAGE_NAME_MAPPINGS = {
     "ImageTile+": "🔧 Image Tile",
     "ImageUntile+": "🔧 Image Untile",
     "RemBGSession+": "🔧 RemBG Session",
+    "TransparentBGSession+": "🔧 InSPyReNet TransparentBG",
 
     # Image processing
     "ImageApplyLUT+": "🔧 Image Apply LUT",
