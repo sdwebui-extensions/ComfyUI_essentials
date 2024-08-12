@@ -1,8 +1,13 @@
+import os
 import comfy.samplers
 import comfy.sample
 import torch
-from nodes import common_ksampler
-from .utils import expand_mask
+from nodes import common_ksampler, CLIPTextEncode
+from comfy.utils import ProgressBar
+from .utils import expand_mask, FONTS_DIR, parse_string_to_list
+import torchvision.transforms.v2 as T
+import torch.nn.functional as F
+import logging
 
 class KSamplerVariationsWithNoise:
     @classmethod
@@ -167,14 +172,380 @@ class InjectLatentNoise:
 
         return (noise_latent, )
 
+class TextEncodeForSamplerParams:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text": ("STRING", {"multiline": True, "dynamicPrompts": True, "default": "Separate prompts with at least three dashes\n---\nLike so"}),
+                "clip": ("CLIP", )
+            }}
+
+    RETURN_TYPES = ("CONDITIONING", )
+    FUNCTION = "execute"
+    CATEGORY = "essentials/sampling"
+
+    def execute(self, text, clip):
+        import re
+        output_text = []
+        output_encoded = []
+        text = re.sub(r'[-*=~]{4,}\n', '---\n', text)
+        text = text.split("---\n")
+
+        for t in text:
+            t = t.strip()
+            if t:
+                output_text.append(t)
+                output_encoded.append(CLIPTextEncode().encode(clip, t)[0])
+        
+        #if len(output_encoded) == 1:
+        #    output = output_encoded[0]
+        #else:
+        output = {"text": output_text, "encoded": output_encoded}
+
+        return (output, )
+
+class SamplerSelectHelper:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            **{s: ("BOOLEAN", { "default": False }) for s in comfy.samplers.KSampler.SAMPLERS},
+        }}
+
+    RETURN_TYPES = ("STRING", )
+    FUNCTION = "execute"
+    CATEGORY = "essentials/sampling"
+
+    def execute(self, **values):
+        values = [v for v in values if values[v]]
+        values = ", ".join(values)
+
+        return (values, )
+
+class SchedulerSelectHelper:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            **{s: ("BOOLEAN", { "default": False }) for s in comfy.samplers.KSampler.SCHEDULERS},
+        }}
+
+    RETURN_TYPES = ("STRING", )
+    FUNCTION = "execute"
+    CATEGORY = "essentials/sampling"
+
+    def execute(self, **values):
+        values = [v for v in values if values[v]]
+        values = ", ".join(values)
+
+        return (values, )
+
+class FluxSamplerParams:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "model": ("MODEL", ),
+                    "conditioning": ("CONDITIONING", ),
+                    "latent_image": ("LATENT", ),
+
+                    "noise": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "?" }),
+                    "sampler": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "euler" }),
+                    "scheduler": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "simple" }),
+                    "steps": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "20" }),
+                    "guidance": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "3.5" }),
+                    "max_shift": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "" }),
+                    "base_shift": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "" }),
+                    "split_sigmas": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "" }),
+                    "denoise": ("STRING", { "multiline": False, "dynamicPrompts": False, "default": "1.0" }),
+                }}
+    
+    RETURN_TYPES = ("LATENT","SAMPLER_PARAMS")
+    RETURN_NAMES = ("latent", "params")
+    FUNCTION = "execute"
+    CATEGORY = "essentials/sampling"
+
+    def execute(self, model, conditioning, latent_image, noise, sampler, scheduler, steps, guidance, max_shift, base_shift, split_sigmas, denoise):
+        import random
+        import time
+        from comfy_extras.nodes_custom_sampler import Noise_RandomNoise, BasicScheduler, BasicGuider, SamplerCustomAdvanced, SplitSigmasDenoise
+        from comfy_extras.nodes_latent import LatentBatch
+        from comfy_extras.nodes_model_advanced import ModelSamplingFlux, ModelSamplingAuraFlow
+        from node_helpers import conditioning_set_values
+
+        is_schnell = model.model.model_type == comfy.model_base.ModelType.FLOW
+
+        noise = noise.replace("\n", ",").split(",")
+        noise = [random.randint(0, 999999) if "?" in n else int(n) for n in noise]
+        if not noise:
+            noise = [random.randint(0, 999999)]
+
+        if sampler == '*':
+            sampler = comfy.samplers.KSampler.SAMPLERS
+        elif sampler.startswith("!"):
+            sampler = sampler.replace("\n", ",").split(",")
+            sampler = [s.strip("! ") for s in sampler]
+            sampler = [s for s in comfy.samplers.KSampler.SAMPLERS if s not in sampler]
+        else:
+            sampler = sampler.replace("\n", ",").split(",")
+            sampler = [s.strip() for s in sampler if s.strip() in comfy.samplers.KSampler.SAMPLERS]
+        if not sampler:
+            sampler = ['ipndm']
+
+        if scheduler == '*':
+            scheduler = comfy.samplers.KSampler.SCHEDULERS
+        elif scheduler.startswith("!"):
+            scheduler = scheduler.replace("\n", ",").split(",")
+            scheduler = [s.strip("! ") for s in scheduler]
+            scheduler = [s for s in comfy.samplers.KSampler.SCHEDULERS if s not in scheduler]
+        else:
+            scheduler = scheduler.replace("\n", ",").split(",")
+            scheduler = [s.strip() for s in scheduler]
+            scheduler = [s for s in scheduler if s in comfy.samplers.KSampler.SCHEDULERS]
+        if not scheduler:
+            scheduler = ['simple']
+
+        if steps == "":
+            if is_schnell:
+                steps = "4"
+            else:
+                steps = "20"
+        steps = parse_string_to_list(steps)
+        
+        denoise = "1.0" if denoise == "" else denoise
+        denoise = parse_string_to_list(denoise)
+
+        guidance = "3.5" if guidance == "" else guidance
+        guidance = parse_string_to_list(guidance)
+        
+        if not is_schnell:
+            max_shift = "1.15" if max_shift == "" else max_shift
+            base_shift = "0.5" if base_shift == "" else base_shift
+        else:
+            max_shift = "0"
+            base_shift = "1.0" if base_shift == "" else base_shift
+
+        max_shift = parse_string_to_list(max_shift)
+        base_shift = parse_string_to_list(base_shift)
+        
+        split_sigmas = "1.0" if split_sigmas == "" else split_sigmas
+        split_sigmas = parse_string_to_list(split_sigmas)
+        
+        cond_text = None
+        if isinstance(conditioning, dict) and "encoded" in conditioning:
+            cond_text = conditioning["text"]
+            cond_encoded = conditioning["encoded"]
+        else:
+            cond_encoded = [conditioning]
+
+        out_latent = None
+        out_params = []
+
+        basicschedueler = BasicScheduler()
+        basicguider = BasicGuider()
+        samplercustomadvanced = SamplerCustomAdvanced()
+        latentbatch = LatentBatch()
+        modelsamplingflux = ModelSamplingFlux() if not is_schnell else ModelSamplingAuraFlow()
+        splitsigmadenoise = SplitSigmasDenoise()
+        width = latent_image["samples"].shape[3]*8
+        height = latent_image["samples"].shape[2]*8
+
+        # count total number of samples
+        total_samples = len(cond_encoded) * len(noise) * len(max_shift) * len(base_shift) * len(guidance) * len(sampler) * len(scheduler) * len(steps) * len(denoise) * len(split_sigmas)
+        current_sample = 0
+        if total_samples > 1:
+            pbar = ProgressBar(total_samples)
+
+        for i in range(len(cond_encoded)):
+            conditioning = cond_encoded[i]
+            ct = cond_text[i] if cond_text else None
+            for n in noise:
+                randnoise = Noise_RandomNoise(n)
+                for ms in max_shift:
+                    for bs in base_shift:
+                        if is_schnell:
+                            work_model = modelsamplingflux.patch_aura(model, bs)[0]
+                        else:
+                            work_model = modelsamplingflux.patch(model, ms, bs, width, height)[0]
+                        for g in guidance:
+                            cond = conditioning_set_values(conditioning, {"guidance": g})
+                            guider = basicguider.get_guider(work_model, cond)[0]
+                            for s in sampler:
+                                samplerobj = comfy.samplers.sampler_object(s)
+                                for sc in scheduler:
+                                    for st in steps:
+                                        for d in denoise:
+                                            sigmas = basicschedueler.get_sigmas(work_model, sc, st, d)[0]
+                                            for ss in split_sigmas:
+                                                current_sample += 1
+                                                logging.info(f"Sampling {current_sample}/{total_samples} with seed {n}, sampler {s}, scheduler {sc}, steps {st}, guidance {g}, max_shift {ms}, base_shift {bs}, denoise {d}, split_sigmas {ss}")
+                                                sigmas = splitsigmadenoise.get_sigmas(sigmas, ss)[1]
+                                                start_time = time.time()
+                                                latent = samplercustomadvanced.sample(randnoise, guider, samplerobj, sigmas, latent_image)[1]
+                                                elapsed_time = time.time() - start_time
+                                                out_params.append({"time": elapsed_time,
+                                                                "seed": n,
+                                                                "width": width,
+                                                                "height": height,
+                                                                "sampler": s,
+                                                                "scheduler": sc,
+                                                                "steps": st,
+                                                                "guidance": g,
+                                                                "max_shift": ms,
+                                                                "base_shift": bs,
+                                                                "denoise": d,
+                                                                "split_sigmas": ss,
+                                                                "prompt": ct})
+
+                                                if out_latent is None:
+                                                    out_latent = latent
+                                                else:
+                                                    out_latent = latentbatch.batch(out_latent, latent)[0]
+                                                if total_samples > 1:
+                                                    pbar.update(1)
+
+        return (out_latent, out_params)
+
+class PlotParameters:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+                    "images": ("IMAGE", ),
+                    "params": ("SAMPLER_PARAMS", ),
+                    "order_by": (["none", "time", "seed", "steps", "denoise", "sampler", "scheduler", "guidance", "max_shift", "base_shift", "split_sigmas"], ),
+                    "cols_value": (["none", "time", "seed", "steps", "denoise", "sampler", "scheduler", "guidance", "max_shift", "base_shift", "split_sigmas"], ),
+                    "cols_num": ("INT", {"default": -1, "min": -1, "max": 1024 }),
+                    "add_prompt": (["false", "true", "excerpt"], ),
+                }}
+
+    RETURN_TYPES = ("IMAGE", )
+    FUNCTION = "execute"
+    CATEGORY = "essentials/sampling"
+
+    def execute(self, images, params, order_by, cols_value, cols_num, add_prompt):
+        from PIL import Image, ImageDraw, ImageFont
+        import math
+        import textwrap
+
+        if images.shape[0] != len(params):
+            raise ValueError("Number of images and number of parameters do not match.")
+
+        if order_by != "none":
+            if cols_value != "none" and cols_num < 1:
+                cols_num = len(set(p[cols_value] for p in params))
+            sorted_params = sorted(params, key=lambda x: x[order_by])
+            indices = [params.index(item) for item in sorted_params]
+            params = sorted_params
+            images = images[torch.tensor(indices)]
+
+        width = images.shape[2]
+        out_image = []
+
+        font = ImageFont.truetype(os.path.join(FONTS_DIR, 'ShareTechMono-Regular.ttf'), min(48, int(32*(width/1024))))
+        text_padding = 3
+        line_height = font.getmask('Q').getbbox()[3] + font.getmetrics()[1] + text_padding*2
+        char_width = font.getbbox('M')[2]+1 # using monospace font
+
+        for (image, param) in zip(images, params):
+            image = image.permute(2, 0, 1)
+
+            text = f"time: {param['time']:.2f}s, seed: {param['seed']}, steps: {param['steps']}, size: {param['width']}×{param['height']}\ndenoise: {param['denoise']}, sampler: {param['sampler']}, sched: {param['scheduler']}\nguidance: {param['guidance']}, max/base shift: {param['max_shift']}/{param['base_shift']}, sigmas: {param['split_sigmas']}"
+            lines = text.split("\n")
+            text_height = line_height * len(lines)
+            text_image = Image.new('RGB', (width, text_height), color=(0, 0, 0))
+
+            for i, line in enumerate(lines):
+                draw = ImageDraw.Draw(text_image)
+                draw.text((text_padding, i * line_height + text_padding), line, font=font, fill=(255, 255, 255))
+            
+            text_image = T.ToTensor()(text_image).to(image.device)
+            image = torch.cat([image, text_image], 1)
+
+            if param['prompt'] and add_prompt != "false":
+                prompt = param['prompt']
+                if add_prompt == "excerpt":
+                    prompt = " ".join(param['prompt'].split()[:64])
+                    prompt += "..."
+
+                cols = math.ceil(width / char_width)
+                prompt_lines = textwrap.wrap(prompt, width=cols)
+                prompt_height = line_height * len(prompt_lines)
+                prompt_image = Image.new('RGB', (width, prompt_height), color=(0, 0, 0))
+
+                for i, line in enumerate(prompt_lines):
+                    draw = ImageDraw.Draw(prompt_image)
+                    draw.text((text_padding, i * line_height + text_padding), line, font=font, fill=(255, 255, 255))
+
+                prompt_image = T.ToTensor()(prompt_image).to(image.device)
+                image = torch.cat([image, prompt_image], 1)
+            
+            # a little cleanup
+            image = torch.nan_to_num(image, nan=0.0).clamp(0.0, 1.0)
+            out_image.append(image)
+        
+        # ensure all images have the same height
+        if add_prompt != "false":
+            max_height = max([image.shape[1] for image in out_image])
+            out_image = [F.pad(image, (0, 0, 0, max_height - image.shape[1])) for image in out_image]
+        
+        out_image = torch.stack(out_image, 0).permute(0, 2, 3, 1)
+
+        if cols_num > -1:
+            if cols_num == 0:
+                cols_num = int(math.sqrt(out_image.shape[0]))
+                cols_num = max(1, min(cols_num, 1024))
+
+            cols = min(cols_num, out_image.shape[0])
+            b, h, w, c = out_image.shape
+            rows = math.ceil(b / cols)
+
+            # Pad the tensor if necessary
+            if b % cols != 0:
+                padding = cols - (b % cols)
+                out_image = F.pad(out_image, (0, 0, 0, 0, 0, 0, 0, padding))
+                b = out_image.shape[0]
+            
+            # Reshape and transpose
+            out_image = out_image.reshape(rows, cols, h, w, c)
+            out_image = out_image.permute(0, 2, 1, 3, 4)
+            out_image = out_image.reshape(rows * h, cols * w, c).unsqueeze(0)
+
+            """
+            width = out_image.shape[2]
+            # add the title and notes on top
+            if title and export_labels:
+                title_font = ImageFont.truetype(os.path.join(FONTS_DIR, 'ShareTechMono-Regular.ttf'), 48)
+                title_width = title_font.getbbox(title)[2]
+                title_padding = 6
+                title_line_height = title_font.getmask(title).getbbox()[3] + title_font.getmetrics()[1] + title_padding*2
+                title_text_height = title_line_height
+                title_text_image = Image.new('RGB', (width, title_text_height), color=(0, 0, 0, 0))
+
+                draw = ImageDraw.Draw(title_text_image)
+                draw.text((width//2 - title_width//2, title_padding), title, font=title_font, fill=(255, 255, 255))
+                
+                title_text_image = T.ToTensor()(title_text_image).unsqueeze(0).permute([0,2,3,1]).to(out_image.device)
+                out_image = torch.cat([title_text_image, out_image], 1)
+            """
+
+        return (out_image, )
+
 SAMPLING_CLASS_MAPPINGS = {
     "KSamplerVariationsStochastic+": KSamplerVariationsStochastic,
     "KSamplerVariationsWithNoise+": KSamplerVariationsWithNoise,
     "InjectLatentNoise+": InjectLatentNoise,
+    "FluxSamplerParams+": FluxSamplerParams,
+    "PlotParameters+": PlotParameters,
+    "TextEncodeForSamplerParams+": TextEncodeForSamplerParams,
+    "SamplerSelectHelper+": SamplerSelectHelper,
+    "SchedulerSelectHelper+": SchedulerSelectHelper,
 }
 
 SAMPLING_NAME_MAPPINGS = {
     "KSamplerVariationsStochastic+": "🔧 KSampler Stochastic Variations",
     "KSamplerVariationsWithNoise+": "🔧 KSampler Variations with Noise Injection",
-    "InjectLatentNoise+": "🔧 Inject Latent Noise"
+    "InjectLatentNoise+": "🔧 Inject Latent Noise",
+    "FluxSamplerParams+": "🔧 Flux Sampler Parameters",
+    "PlotParameters+": "🔧 Plot Sampler Parameters",
+    "TextEncodeForSamplerParams+": "🔧Text Encode for Sampler Params",
+    "SamplerSelectHelper+": "🔧 Sampler Select Helper",
+    "SchedulerSelectHelper+": "🔧 Scheduler Select Helper",
 }
