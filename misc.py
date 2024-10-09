@@ -3,6 +3,7 @@ import torch
 from .utils import AnyType
 import comfy.model_management
 from nodes import MAX_RESOLUTION
+import time
 
 any = AnyType("*")
 
@@ -60,14 +61,46 @@ class SimpleMathSlider:
         return {
             "required": {
                 "value": ("FLOAT", { "display": "slider", "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.001 }),
+                "min": ("FLOAT", { "default": 0.0, "min": -0xffffffffffffffff, "max": 0xffffffffffffffff, "step": 0.001 }),
+                "max": ("FLOAT", { "default": 1.0, "min": -0xffffffffffffffff, "max": 0xffffffffffffffff, "step": 0.001 }),
+                "rounding": ("INT", { "default": 0, "min": 0, "max": 10, "step": 1 }),
             },
         }
 
-    RETURN_TYPES = ("FLOAT",)
+    RETURN_TYPES = ("FLOAT", "INT",)
     FUNCTION = "execute"
     CATEGORY = "essentials/utilities"
 
-    def execute(self, value):
+    def execute(self, value, min, max, rounding):
+        value = min + value * (max - min)
+        
+        if rounding > 0:
+            value = round(value, rounding)
+
+        return (value, int(value), )
+
+class SimpleMathSliderLowRes:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "value": ("INT", { "display": "slider", "default": 5, "min": 0, "max": 10, "step": 1 }),
+                "min": ("FLOAT", { "default": 0.0, "min": -0xffffffffffffffff, "max": 0xffffffffffffffff, "step": 0.001 }),
+                "max": ("FLOAT", { "default": 1.0, "min": -0xffffffffffffffff, "max": 0xffffffffffffffff, "step": 0.001 }),
+                "rounding": ("INT", { "default": 0, "min": 0, "max": 10, "step": 1 }),
+            },
+        }
+
+    RETURN_TYPES = ("FLOAT", "INT",)
+    FUNCTION = "execute"
+    CATEGORY = "essentials/utilities"
+
+    def execute(self, value, min, max, rounding):
+        value = 0.1 * value
+        value = min + value * (max - min)
+        if rounding > 0:
+            value = round(value, rounding)
+
         return (value, )
 
 class SimpleMathBoolean:
@@ -84,7 +117,7 @@ class SimpleMathBoolean:
     CATEGORY = "essentials/utilities"
 
     def execute(self, value):
-        return (value, )
+        return (value, int(value), )
 
 class SimpleMath:
     @classmethod
@@ -108,11 +141,25 @@ class SimpleMath:
         import ast
         import operator as op
 
-        a = float(a)
-        b = float(b)
-        c = float(c)
-        d = float(d)
+        h, w = 0.0, 0.0
+        if hasattr(a, 'shape'):
+            a = list(a.shape)
+        if hasattr(b, 'shape'):
+            b = list(b.shape)
+        if hasattr(c, 'shape'):
+            c = list(c.shape)
+        if hasattr(d, 'shape'):
+            d = list(d.shape)
 
+        if isinstance(a, str):
+            a = float(a)
+        if isinstance(b, str):
+            b = float(b)
+        if isinstance(c, str):
+            c = float(c)
+        if isinstance(d, str):
+            d = float(d)
+        
         operators = {
             ast.Add: op.add,
             ast.Sub: op.sub,
@@ -120,7 +167,9 @@ class SimpleMath:
             ast.Div: op.truediv,
             ast.FloorDiv: op.floordiv,
             ast.Pow: op.pow,
-            ast.BitXor: op.xor,
+            #ast.BitXor: op.xor,
+            #ast.BitOr: op.or_,
+            #ast.BitAnd: op.and_,
             ast.USub: op.neg,
             ast.Mod: op.mod,
             ast.Eq: op.eq,
@@ -129,8 +178,8 @@ class SimpleMath:
             ast.LtE: op.le,
             ast.Gt: op.gt,
             ast.GtE: op.ge,
-            #ast.And: op.and_,
-            #ast.Or: op.or_,
+            ast.And: lambda x, y: x and y,
+            ast.Or: lambda x, y: x or y,
             ast.Not: op.not_
         }
 
@@ -165,10 +214,8 @@ class SimpleMath:
                         return 0
                 return 1
             elif isinstance(node, ast.BoolOp):  # boolean operators (And, Or)
-                if isinstance(node.op, ast.And):
-                    return all(eval_(value) for value in node.values)
-                elif isinstance(node.op, ast.Or):
-                    return any(eval_(value) for value in node.values)
+                values = [eval_(value) for value in node.values]
+                return operators[type(node.op)](*values)
             elif isinstance(node, ast.Call): # custom function
                 if node.func.id in op_functions:
                     args =[eval_(arg) for arg in node.args]
@@ -253,7 +300,7 @@ class SimpleCondition:
         }
 
     RETURN_TYPES = (any,)
-    RETURN_NAMES = ("value",)
+    RETURN_NAMES = ("result",)
     FUNCTION = "execute"
 
     CATEGORY = "essentials/utilities"
@@ -395,7 +442,7 @@ class ModelCompile():
     def execute(self, model, fullgraph, dynamic, mode):
         work_model = model.clone()
         torch._dynamo.config.suppress_errors = True
-        work_model.model.diffusion_model = torch.compile(work_model.model.diffusion_model, dynamic=dynamic, fullgraph=fullgraph, mode=mode)
+        work_model.add_object_patch("diffusion_model", torch.compile(model=work_model.get_model_object("diffusion_model"), dynamic=dynamic, fullgraph=fullgraph, mode=mode))
         return (work_model, )
 
 class RemoveLatentMask:
@@ -441,10 +488,54 @@ class SDXLEmptyLatentSizePicker:
 
         return ({"samples":latent}, width, height,)
 
+class DisplayAny:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "input": (("*",{})),
+                "mode": (["raw value", "tensor shape"],),
+            },
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(s, input_types):
+        return True
+
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "execute"
+    OUTPUT_NODE = True
+
+    CATEGORY = "essentials/utilities"
+
+    def execute(self, input, mode):
+        if mode == "tensor shape":
+            text = []
+            def tensorShape(tensor):
+                if isinstance(tensor, dict):
+                    for k in tensor:
+                        tensorShape(tensor[k])
+                elif isinstance(tensor, list):
+                    for i in range(len(tensor)):
+                        tensorShape(tensor[i])
+                elif hasattr(tensor, 'shape'):
+                    text.append(list(tensor.shape))
+
+            tensorShape(input)
+            input = text
+
+        text = str(input)
+
+        return {"ui": {"text": text}, "result": (text,)}
+
 MISC_CLASS_MAPPINGS = {
     "BatchCount+": BatchCount,
     "ConsoleDebug+": ConsoleDebug,
     "DebugTensorShape+": DebugTensorShape,
+    "DisplayAny": DisplayAny,
     "ModelCompile+": ModelCompile,
     "RemoveLatentMask+": RemoveLatentMask,
     "SDXLEmptyLatentSizePicker+": SDXLEmptyLatentSizePicker,
@@ -458,12 +549,14 @@ MISC_CLASS_MAPPINGS = {
     "SimpleMathInt+": SimpleMathInt,
     "SimpleMathPercent+": SimpleMathPercent,
     "SimpleMathSlider+": SimpleMathSlider,
+    "SimpleMathSliderLowRes+": SimpleMathSliderLowRes,
 }
 
 MISC_NAME_MAPPINGS = {
     "BatchCount+": "🔧 Batch Count",
     "ConsoleDebug+": "🔧 Console Debug",
     "DebugTensorShape+": "🔧 Debug Tensor Shape",
+    "DisplayAny": "🔧 Display Any",
     "ModelCompile+": "🔧 Model Compile",
     "RemoveLatentMask+": "🔧 Remove Latent Mask",
     "SDXLEmptyLatentSizePicker+": "🔧 Empty Latent Size Picker",
@@ -477,4 +570,5 @@ MISC_NAME_MAPPINGS = {
     "SimpleMathInt+": "🔧 Simple Math Int",
     "SimpleMathPercent+": "🔧 Simple Math Percent",
     "SimpleMathSlider+": "🔧 Simple Math Slider",
+    "SimpleMathSliderLowRes+": "🔧 Simple Math Slider low-res",
 }

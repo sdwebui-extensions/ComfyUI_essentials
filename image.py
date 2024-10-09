@@ -10,12 +10,13 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.v2 as T
 
-import warnings
-warnings.filterwarnings('ignore', module="torchvision")
+#import warnings
+#warnings.filterwarnings('ignore', module="torchvision")
 import math
 import os
 import numpy as np
 import folder_paths
+from pathlib import Path
 import random
 
 """
@@ -195,6 +196,23 @@ class ImageListToBatch:
         out = torch.cat(out, dim=0)
 
         return (out,)
+
+class ImageBatchToList:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "execute"
+    CATEGORY = "essentials/image batch"
+
+    def execute(self, image):
+        return ([image[i].unsqueeze(0) for i in range(image.shape[0])], )
 
 
 """
@@ -824,8 +842,9 @@ class ImageRemoveBackground:
         output = torch.stack(output, dim=0)
         output = output.permute([0, 2, 3, 1])
         mask = output[:, :, :, 3] if output.shape[3] == 4 else torch.ones_like(output[:, :, :, 0])
+        # output = output[:, :, :, :3]
 
-        return(output[:, :, :, :3], mask,)
+        return(output, mask,)
 
 """
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -926,8 +945,6 @@ class ImagePosterize:
 
         return(image,)
 
-
-LUTS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "luts")
 # From https://github.com/yoonsikp/pycubelut/blob/master/pycubelut.py (MIT license)
 class ImageApplyLUT:
     @classmethod
@@ -935,7 +952,7 @@ class ImageApplyLUT:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "lut_file": (sorted([f for f in os.listdir(LUTS_DIR) if f.lower().endswith('.cube')]), ),
+                "lut_file": (folder_paths.get_filename_list("luts"),),
                 "gamma_correction": ("BOOLEAN", { "default": True }),
                 "clip_values": ("BOOLEAN", { "default": True }),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.1 }),
@@ -947,10 +964,15 @@ class ImageApplyLUT:
 
     # TODO: check if we can do without numpy
     def execute(self, image, lut_file, gamma_correction, clip_values, strength):
+        lut_file_path = folder_paths.get_full_path("luts", lut_file)
+        if not lut_file_path or not Path(lut_file_path).exists():
+            print(f"Could not find LUT file: {lut_file_path}")
+            return (image,)
+            
         from colour.io.luts.iridas_cube import read_LUT_IridasCube
-
+        
         device = image.device
-        lut = read_LUT_IridasCube(os.path.join(LUTS_DIR, lut_file))
+        lut = read_LUT_IridasCube(lut_file_path)
         lut.name = lut_file
 
         if clip_values:
@@ -1667,6 +1689,7 @@ IMAGE_CLASS_MAPPINGS = {
     "ImageExpandBatch+": ImageExpandBatch,
     "ImageFromBatch+": ImageFromBatch,
     "ImageListToBatch+": ImageListToBatch,
+    "ImageBatchToList+": ImageBatchToList,
 
     # Image manipulation
     "ImageCompositeFromMaskBatch+": ImageCompositeFromMaskBatch,
@@ -1699,7 +1722,6 @@ IMAGE_CLASS_MAPPINGS = {
     "ImageToDevice+": ImageToDevice,
     "ImagePreviewFromLatent+": ImagePreviewFromLatent,
     "NoiseFromImage+": NoiseFromImage,
-
     #"ExtractKeyframes+": ExtractKeyframes,
 }
 
@@ -1712,6 +1734,7 @@ IMAGE_NAME_MAPPINGS = {
     "ImageExpandBatch+": "🔧 Image Expand Batch",
     "ImageFromBatch+": "🔧 Image From Batch",
     "ImageListToBatch+": "🔧 Image List To Batch",
+    "ImageBatchToList+": "🔧 Image Batch To List",
 
     # Image manipulation
     "ImageCompositeFromMaskBatch+": "🔧 Image Composite From Mask Batch",
